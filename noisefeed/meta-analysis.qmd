@@ -1,0 +1,681 @@
+---
+title: "Meta analysis"
+date: today
+format: html
+code-tools: true
+code-fold: true
+embed-resources: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| code-summary: Load packages and setup
+#| message: false
+#| warning: false
+
+suppressPackageStartupMessages({
+  suppressWarnings({
+    library(tidyverse)
+    library(lme4)
+    library(metafor)
+  })
+})
+```
+
+```{r}
+#| code-summary: Load dataset
+match_injury <- readRDS(here::here("output/match-played-seleced-team.rds")) |> 
+  summarize(
+    across(c(n_match, n_injury), \(x) sum(x, na.rm = TRUE)),
+    .by = c(league, league_tag, team, team_tag, season)
+  ) |> 
+  mutate(
+    match_exposure = n_match * 11 * 1.5,
+    match_injury_rate = (n_injury / match_exposure) * 1000
+  ) |> 
+  mutate(season = str_extract(season, "\\d+") |> as.numeric()) |> 
+  separate_wider_regex(league, c(country = ".*?", ". ", league = ".*"))
+  
+match_injury |> glimpse()
+```
+
+## Injury Rate (2019–2024)
+
+::: panel-tabset
+
+### By league and season
+
+```{r}
+#| code-summary: Plot match injury rate by league and season
+#| fig-width: 8
+#| out-width: 100%
+#| fig-asp: 0.9
+
+match_injury |> 
+  filter(between(season, 2021, 2024)) |> 
+  ggplot(aes(n_match, match_injury_rate)) +
+  geom_point(shape = 21, fill = "whitesmoke", stroke = 1) +
+  geom_smooth(method = "lm", formula = "y ~ x", fullrange = TRUE) +
+  facet_grid(cols = vars(season), rows = vars(league)) +
+  scale_color_brewer(palette = "Set1") +
+  coord_cartesian(xlim = c(20, 75)) +
+  theme(
+    legend.position = "bottom",
+    legend.justification = "left"
+  ) +
+  labs(
+    x = "Number of match",
+    y = "Injury Rate (#injury/#match exposure) * 1000"
+  )
+```
+
+### By season
+
+```{r}
+#| code-summary: Plot match injury rate by season
+#| fig-width: 7
+#| out-width: 100%
+#| fig-asp: 0.8
+
+match_injury |> 
+  filter(between(season, 2019, 2024)) |>
+  ggplot(aes(n_match, match_injury_rate)) +
+  geom_point(shape = 21, fill = "whitesmoke", stroke = 1) +
+  geom_smooth(method = "lm", formula = "y ~ x", fullrange = TRUE) +
+  facet_wrap(facet = vars(season)) +
+  scale_color_brewer(palette = "Set1") +
+  coord_cartesian(xlim = c(20, 75)) +
+  theme(
+    legend.position = "bottom",
+    legend.justification = "left"
+  ) +
+  labs(
+    x = "Number of match",
+    y = "Injury Rate (#injury/#match exposure) * 1000"
+  )
+```
+
+### Overall
+
+```{r}
+#| code-summary: Plot match injury rate by season
+#| fig-width: 7
+#| out-width: 100%
+#| fig-asp: 0.8
+
+match_injury |> 
+  filter(between(season, 2019, 2024)) |>
+  ggplot(aes(n_match, match_injury_rate)) +
+  geom_point(
+    shape = 21, fill = "whitesmoke", stroke = 1, 
+    position = position_jitter(width = 2, height = 2)
+  ) +
+  geom_smooth(method = "lm", formula = "y ~ x", fullrange = TRUE) +
+  scale_color_brewer(palette = "Set1") +
+  coord_cartesian(xlim = c(20, 75)) +
+  theme(
+    legend.position = "bottom",
+    legend.justification = "left"
+  ) +
+  labs(
+    x = "Number of match",
+    y = "Injury Rate (#injury/#match exposure) * 1000"
+  )
+```
+
+:::
+
+## Modelling
+
+### Joint Analysis
+
+```{r}
+#| code-summary: Generalized mix-effect model - league:team as random factor
+
+match_injury_joint_model <- match_injury |> 
+  mutate(
+    season_z = (season - mean(season)) / sd(season),
+    match_played_z = (n_match - mean(n_match)) / sd(n_match)
+  ) |> 
+  lme4::glmer(
+    n_injury ~ match_played_z + season_z + league + (1 | league:team),
+    data = _,
+    family = poisson(link = "log"),
+    offset = log(match_exposure)
+  )
+summary(match_injury_joint_model)
+```
+
+### Separate model for each league
+
+```{r}
+#| code-summary: Generalized mix-effect model by league - team as random factor
+
+match_injury_league_models <- match_injury |> 
+  mutate(
+    season_z = (season - mean(season)) / sd(season),
+    match_played_z = (n_match - mean(n_match)) / sd(n_match)
+  ) |> 
+  group_by(league) |>
+  group_map(~lme4::glmer(
+    n_injury ~ match_played_z + season_z + (1 | team),
+    data = .x,
+    family = poisson(link = "log"),
+    offset = log(match_exposure)
+  ))
+names(match_injury_league_models) <- unique(match_injury$league)
+```
+
+::: panel-tabset
+
+```{r}
+#| code-summary: Summary of league-specific models
+#| results: asis
+
+iwalk(match_injury_league_models, function(.mdl, .name) {
+  cat(glue::glue("#### {.name}"), "\n\n")
+  cat("```txt\n")
+  cat(paste(capture.output(summary(.mdl)), collapse = "\n"))
+  cat("\n```\n\n")
+  cat("\n\n")
+})
+```
+
+:::
+
+
+## Meta Analysis
+
+```{r}
+#| code-summary: Gather coefficients from each league specific model
+
+league_models_coef <- match_injury_league_models |> 
+  map_dfr(broom.mixed::tidy, .id = "league")
+```
+
+### Fixed effect model
+
+::: panel-tabset
+
+#### Summary
+
+```{r}
+#| code-summary: Meta analysis using fixed-effect method
+#| results: asis
+
+meta_analysis_fe <- league_models_coef |> 
+  filter(is.na(group)) |> 
+  group_by(term) |> 
+  group_map(function(.term, .name) {
+    metafor::rma.uni(
+      yi = estimate,
+      sei = std.error,
+      data = .term,
+      method = "FE",
+      slab = league
+    )
+  }) |> 
+  setNames(head(gsub("[\\(\\)]", "", unique(league_models_coef$term)), -1))
+
+cat("::: panel-tabset\n\n")
+iwalk(meta_analysis_fe, function(.mdl, .name) {
+  cat(glue::glue("#### {.name}"), "\n\n")
+  
+  cat("```txt\n")
+  cat(paste(capture.output(summary(.mdl)), collapse = "\n"))
+  cat("\n```\n\n")
+  
+  cat("\n\n")
+})
+cat(":::\n\n")
+```
+
+#### Plot
+
+```{r}
+#| code-summary: Estimates from meta analysis using random-effect
+#| results: asis
+#| fig-width: 9
+#| out-width: 100%
+#| fig-asp: 0.7
+
+cat("::: panel-tabset\n\n")
+iwalk(meta_analysis_fe, function(.mdl, .name) {
+  cat(glue::glue("#### {.name}"), "\n\n")
+  metafor::forest.rma(x = .mdl, showweights = TRUE)
+  cat("\n\n")
+})
+cat(":::\n\n")
+```
+
+:::
+
+### Random effect model
+
+::: panel-tabset
+
+#### Summary
+
+```{r}
+#| code-summary: Meta analysis using random-effect method
+#| results: asis
+
+meta_analysis_re <- league_models_coef |> 
+  filter(is.na(group)) |> 
+  group_by(term) |> 
+  group_map(function(.term, .name) {
+    metafor::rma.uni(
+      yi = estimate,
+      sei = std.error,
+      data = .term,
+      method = "REML",
+      slab = league
+    )
+  }) |> 
+  setNames(head(gsub("[\\(\\)]", "", unique(league_models_coef$term)), -1))
+
+cat("::: panel-tabset\n\n")
+iwalk(meta_analysis_re, function(.mdl, .name) {
+  cat(glue::glue("#### {.name}"), "\n\n")
+  
+  cat("```txt\n")
+  cat(paste(capture.output(summary(.mdl)), collapse = "\n"))
+  cat("\n```\n\n")
+  
+  cat("\n\n")
+})
+cat(":::\n\n")
+```
+
+#### Plot
+
+```{r}
+#| code-summary: Estimates from meta analysis using random-effect
+#| results: asis
+#| fig-width: 9
+#| out-width: 100%
+#| fig-asp: 0.7
+
+cat("::: panel-tabset\n\n")
+iwalk(meta_analysis_re, function(.mdl, .name) {
+  cat(glue::glue("#### {.name}"), "\n\n")
+  
+  metafor::forest.rma(
+    x = .mdl,
+    predstyle = "dist",
+    showweights = TRUE
+  )
+  
+  cat("\n\n")
+})
+cat(":::\n\n")
+```
+
+#### BLUPs
+
+
+```{r}
+#| code-summary: Best Linear Unbiased Prediction (BLUP)
+#| results: asis
+#| fig-width: 9
+#| out-width: 100%
+#| fig-asp: 0.7
+
+cat("::: panel-tabset\n\n")
+iwalk(meta_analysis_re, function(.mdl, .name) {
+  cat(glue::glue("#### {.name}"), "\n\n")
+  
+  cat("**BLUP Estimates**\n")
+  
+  cat("```txt\n")
+  cat(paste(capture.output(blup(.mdl)), collapse = "\n"))
+  cat("\n```\n\n")
+  
+  cat("**Pooled Estimates**\n")
+  
+  cat("```txt\n")
+  cat(paste(capture.output(predict(.mdl)), collapse = "\n"))
+  cat("\n```\n\n")
+  
+  cat("\n\n")
+})
+cat(":::\n\n")
+```
+
+
+:::
+
+# AI Assisted Report
+
+**Summarizing meta-analysis results**
+
+I need to summarize and analyze the meta-analysis results in a structured way, using both math and plain language. I'll break it down into sections like Introduction, Data & Outcome, Primary Joint Model, League-Specific Models, Meta-analysis of Coefficients, and Practical Interpretation. I'll also touch on limitations and conclusions. I need to explain concepts like the log link, Poisson distribution, and how to compute the Injury Rate Ratio (IRR) using exponentiation, like exp(0.114). I'll keep it concise but complete.
+# Injury meta analysis report across the top 5 European leagues
+
+You’ve already done a lot of the heavy lifting with the models—what I’ll do here is turn those results into a coherent story, moving between the math and what it means in football terms.
+
+---
+
+## 1. Data and outcome
+
+The dataset contains:
+
+- **Leagues:** Bundesliga, La Liga, Ligue 1, Premier League, Serie A  
+- **Units:** Team–season observations (1,560 rows, 186 teams)  
+- **Outcome:**  
+  - **`n_injury`** = number of match injuries per team per season  
+  - **Exposure:** `match_exposure` (match minutes or match-hours), used as an **offset**  
+- **Key predictors:**
+  - **`n_match`** (standardized to `match_played_z`): number of matches played  
+  - **`season`** (standardized to `season_z`): time trend (2010–2024)  
+  - **`league`**: categorical factor  
+- **Model family:** Poisson with log link, i.e. modeling **injury counts** with **log(injury rate)** as the linear predictor.
+
+In plain language: you’re modeling **injury rates per unit of match exposure**, adjusting for how many matches a team plays and how late in the time period the season is, with teams nested in leagues.
+
+---
+
+## 2. Joint generalized linear mixed model
+
+### 2.1 Model specification
+
+Joint model:
+
+$$
+\log(\lambda_{ij}) = \beta_0 + \beta_1 \text{match\_played\_z}_{ij} + \beta_2 \text{season\_z}_{ij} + \beta_{\text{league}} + u_{\text{league:team}} ,
+$$
+
+with
+
+- $\lambda_{ij}$ = expected injury rate for team $j$ in league $i$ per unit exposure  
+- Offset: $\log(\text{match\_exposure})$  
+- Random intercept: $u_{\text{league:team}} \sim N(0, \sigma^2)$
+
+### 2.2 Key fixed effects (joint model)
+
+From the joint model:
+
+- **Intercept:** $\hat\beta_0 = -4.1875$  
+- **Match played (z):** $\hat\beta_1 = 0.1083$  
+- **Season (z):** $\hat\beta_2 = 0.5902$  
+- **League effects (vs Bundesliga as reference):**  
+  - La Liga: $-0.1891$  
+  - Ligue 1: $-0.2589$  
+  - Premier League: $-0.0288$ (ns)  
+  - Serie A: $-0.0511$ (ns)
+
+All p-values for `match_played_z` and `season_z` are \< 0.001.
+
+### 2.3 Interpretation in plain language
+
+- **Baseline injury rate:**  
+  The intercept $-4.19$ is the log injury rate at:
+  - average number of matches,
+  - average season (centered),
+  - in the reference league (Bundesliga),
+  - for an “average” team.
+
+  Converting to a rate:
+
+  $$
+  \text{Rate}_0 = e^{-4.1875} \approx 0.0152
+  $$
+
+  So roughly **15 injuries per 1,000 units of exposure** (depending on how exposure is scaled).
+
+- **Effect of number of matches (`match_played_z`):**  
+  $$
+  \text{IRR}_{\text{match}} = e^{0.1083} \approx 1.11
+  $$
+
+  A **1 SD increase in number of matches** is associated with about an **11% higher injury rate**, holding season and league constant. Here as well, possibly affected by better coverage of injuries in more recent years.
+
+- **Effect of season (`season_z`):**  
+  $$
+  \text{IRR}_{\text{season}} = e^{0.5902} \approx 1.80
+  $$
+
+  A **1 SD increase in season (i.e., moving towards more recent years)** is associated with about an **80% higher injury rate**, after adjusting for matches and league. This is a very strong upward time trend.
+
+- **League differences (vs Bundesliga):**
+  - La Liga: $e^{-0.1891} \approx 0.83$ → about **17% lower injury rate** than Bundesliga, all else equal.  
+  - Ligue 1: $e^{-0.2589} \approx 0.77$ → about **23% lower injury rate**.  
+  - Premier League and Serie A: small, non-significant differences vs Bundesliga.
+
+In words: **injury rates are increasing over time**, higher for teams that play more matches, and slightly lower in La Liga and Ligue 1 compared to Bundesliga, with Premier League and Serie A roughly similar to Bundesliga once you adjust for other factors.
+
+---
+
+## 3. League-specific mixed models
+
+You then fit **separate Poisson mixed models by league**, each with:
+
+$$
+\log(\lambda_{jt}) = \alpha_0 + \alpha_1 \text{match\_played\_z}_{jt} + \alpha_2 \text{season\_z}_{jt} + u_{\text{team}},
+$$
+
+with random intercepts for teams.
+
+### 3.1 Coefficients by league
+
+**Intercepts (log rates):**
+
+- Bundesliga: $-4.18$  
+- Ligue 1: $-4.40$  
+- Premier League: $-4.46$  
+- La Liga: $-4.19$  
+- Serie A: $-4.23$
+
+These are all in a fairly narrow band, roughly $-4.46$ to $-4.18$.
+
+**Match played (z):**
+
+- Bundesliga: 0.1299  
+- Ligue 1: 0.0945  
+- Premier League: 0.1540  
+- La Liga: 0.1029  
+- Serie A: 0.1027  
+
+All positive, all highly significant.
+
+**Season (z):**
+
+- Bundesliga: 0.5841  
+- Ligue 1: 0.6314  
+- Premier League: 0.7199  
+- La Liga: 0.4936  
+- Serie A: 0.5777  
+
+Again, all positive and highly significant, but with noticeable variation across leagues.
+
+### 3.2 Interpretation
+
+- **Within each league**, more matches and later seasons are consistently associated with **higher injury rates**.
+- The **magnitude** of the season effect differs:
+  - Strongest in the **Premier League** (~0.72),
+  - Weakest in **La Liga** (~0.49),
+  - Others in between (~0.58–0.63).
+
+So the **direction of effect is stable across leagues**, but the **strength** of the time trend and baseline level varies.
+
+---
+
+## 4. Meta-analysis of league-specific coefficients
+
+You then treat each league’s coefficient as a “study” and perform meta-analyses (k = 5) for:
+
+- Intercept  
+- `match_played_z`  
+- `season_z`  
+
+using both **fixed-effect** and **random-effects** models.
+
+### 4.1 Intercept
+
+#### Fixed-effect model
+
+- Estimate: $-4.3017$  
+- SE: 0.0173  
+- 95% CI: $[-4.3355, -4.2679]$  
+- Heterogeneity:  
+  - $I^2 = 91.43\%$ → very high  
+  - Q-test p \< 0.0001
+
+Interpretation: the **average baseline log injury rate** across leagues is about $-4.30$, but there is **substantial between-league heterogeneity** in intercepts.
+
+#### Random-effects model
+
+- Estimate: $-4.2930$  
+- SE: 0.0579  
+- 95% CI: $[-4.4064, -4.1795]$  
+- Predictive interval: $[-4.56, -4.03]$  
+- $I^2 = 91.01\%$, $\tau \approx 0.123$
+
+Converting the pooled intercept:
+
+$$
+e^{-4.2930} \approx 0.0137
+$$
+
+So roughly **14 injuries per 1,000 exposure units** on average, with meaningful variation across leagues.
+
+**Plain language:**  
+The **average baseline injury rate** across the five leagues is similar, but the high $I^2$ tells us that **leagues differ more than we’d expect by chance**. The random-effects model acknowledges that and gives a wider interval and a predictive range for a “new” league.
+
+---
+
+### 4.2 `match_played_z`
+
+#### Fixed-effect model
+
+- Estimate: 0.1132  
+- SE: 0.0089  
+- 95% CI: $[0.0958, 0.1306]$  
+- $I^2 = 27.37\%$, Q p = 0.2391 (no strong evidence of heterogeneity)
+
+#### Random-effects model
+
+- Estimate: 0.1140  
+- SE: 0.0102  
+- 95% CI: $[0.0940, 0.1339]$  
+- Predictive interval: $[0.0846, 0.1433]$  
+- $I^2 = 23.26\%$, very low $\tau^2$
+
+Exponentiating:
+
+$$
+\text{IRR}_{\text{match, pooled}} = e^{0.1140} \approx 1.12
+$$
+
+So a **1 SD increase in matches** is associated with about a **12% higher injury rate**, and this effect is **remarkably consistent across leagues**.
+
+**Plain language:**  
+The relationship between **number of matches and injury risk** is **stable and robust** across all five leagues. More matches → more injuries, and the size of that effect is similar everywhere.
+
+---
+
+### 4.3 `season_z`
+
+#### Fixed-effect model
+
+- Estimate: 0.5901  
+- SE: 0.0088  
+- 95% CI: $[0.5728, 0.6074]$  
+- $I^2 = 93.77\%$, Q p \< 0.0001 → very high heterogeneity
+
+#### Random-effects model
+
+- Estimate: 0.6006  
+- SE: 0.0368  
+- 95% CI: $[0.5284, 0.6727]$  
+- Predictive interval: $[0.4283, 0.7729]$  
+- $I^2 = 94.18\%$, $\tau \approx 0.080$
+
+Exponentiating:
+
+$$
+\text{IRR}_{\text{season, pooled}} = e^{0.6006} \approx 1.82
+$$
+
+So a **1 SD increase in season** (moving forward in time) is associated with about an **82% higher injury rate on average**, but the **strength of this trend varies a lot between leagues**.
+
+**Plain language:**  
+Injury rates are **rising over time in all leagues**, but **not equally**. Some leagues (e.g., Premier League) show a stronger increase than others (e.g., La Liga). The random-effects model captures this by giving a wider interval and a predictive range for what you might see in another league.
+
+---
+
+## 5. BLUPs and pooled predictions
+
+The BLUPs (Best Linear Unbiased Predictions) give **league-specific predicted coefficients** under the random-effects meta-analytic framework.
+
+### 5.1 Intercept BLUPs
+
+- Range roughly from $-4.45$ (Premier League) to $-4.20$ (La Liga), with narrow prediction intervals per league.
+- Pooled estimate: $-4.2930$ (as above).
+
+**Interpretation:**  
+Leagues differ modestly in baseline injury rates, but all sit in a fairly tight band around the pooled value.
+
+### 5.2 `match_played_z` BLUPs
+
+- League-specific predictions: ~0.108–0.122  
+- Pooled: 0.1140, 95% CI $[0.0940, 0.1339]$
+
+**Interpretation:**  
+The **effect of match load is extremely consistent**—every league’s BLUP is close to the pooled estimate.
+
+### 5.3 `season_z` BLUPs
+
+- League-specific predictions:  
+  - La Liga: ~0.50  
+  - Bundesliga/Serie A: ~0.58  
+  - Ligue 1: ~0.63  
+  - Premier League: ~0.71  
+- Pooled: 0.6006, 95% CI $[0.5284, 0.6727]$
+
+**Interpretation:**  
+All leagues show **positive time trends**, but the **Premier League sits at the high end**, La Liga at the low end, with others in between.
+
+---
+
+## 6. Practical interpretation and implications
+
+### 6.1 Core findings
+
+- **Injury rates are increasing over time** (large, consistent positive `season_z` effect). This is possibly affected by better coverage of injuries in more recent years.
+- **More matches → more injuries**, with a **stable ~10–15% increase per SD of match load** across all leagues.
+- **Baseline injury levels differ modestly between leagues**, with La Liga and Ligue 1 slightly lower than Bundesliga, and Premier League/Serie A similar to Bundesliga.
+- **Heterogeneity is high for intercepts and time trends**, but **low for the match-load effect**.
+
+### 6.2 What this means in football terms
+
+- **Workload management:**  
+  The match-load effect is robust: **adding more matches reliably increases injury risk**, regardless of league. This supports policies around squad rotation, fixture congestion management, and rest periods.
+
+- **Temporal trend:**  
+  The strong positive time trend suggests that **modern football is becoming more injury-prone**—possibly due to higher intensity, tighter schedules, or changes in style of play. The fact that this trend is stronger in some leagues (e.g., Premier League) hints at **league-specific structural or tactical factors**.
+
+- **Cross-league comparisons:**  
+  While leagues differ somewhat in baseline injury rates, the **mechanisms linking load and time to injuries are broadly similar**. This makes cross-league lessons and interventions more transferable, especially around match congestion.
+
+---
+
+## 7. Limitations and considerations
+
+- **Poisson assumption:**  
+  If there is overdispersion (variance > mean), a negative binomial model might be more appropriate. The mixed model and random effects help, but don’t fully guarantee perfect fit.
+- **Standardization:**  
+  Effects are in units of **standard deviations**, which is great for comparability but less intuitive for practitioners. Translating SDs into actual match counts per league would help communication.
+- **Unmeasured confounders:**  
+  No direct adjustment for training load, travel, schedule density, or rule changes—these may partly drive the time trend.
+- **Exposure scaling:**  
+  Interpretation in “per 1,000 exposure units” depends on how `match_exposure` is defined (minutes, hours, etc.). Making that explicit would sharpen the practical meaning.
+
+---
+
+## 8. Short, plain-language summary
+
+Across the top five European leagues, teams that **play more matches** and seasons in **more recent years** have **higher match injury rates**. The effect of **match load** is consistent across leagues, while the **increase over time** is strong everywhere but varies in size—strongest in the Premier League, weakest in La Liga. Baseline injury levels differ somewhat between leagues, but not dramatically. Overall, the meta-analysis paints a clear picture: **modern football is getting more injury-intensive, and fixture congestion is a key, stable risk factor across competitions.**
+
+If you’d like, we can next translate these log-scale effects into **concrete example scenarios** (e.g., “what happens if a team plays 5 extra matches?”) for a report or presentation.
